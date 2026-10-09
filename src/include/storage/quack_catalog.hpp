@@ -17,6 +17,7 @@ namespace duckdb {
 class QuackCatalog;
 class QuackClient;
 class QuackClientConnection;
+class PrepareResponseMessage;
 
 class QuackCatalog : public Catalog {
 public:
@@ -70,6 +71,11 @@ public:
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<SQLStatement> statement) override;
 	unique_ptr<TableRef> RemoteExecute(ClientContext &context, const string &sql) override;
+	unique_ptr<TableRef> RemoteExecute(ClientContext &context, const string &sql,
+	                                  const identifier_map_t<BoundParameterData> &parameters) override;
+	PreparedStatementInfo RemotePrepare(ClientContext &context, SQLStatement &statement) override;
+	bool RemoteIsAutoCommit(ClientContext &context) override;
+	static void SetConnectQueryMetadata(ClientContext &context, const PrepareResponseMessage &response);
 	string GetConnectDisplay() override {
 		return GetDBPath();
 	}
@@ -79,6 +85,7 @@ public:
 	const string &GetConnectionId();
 
 	shared_ptr<QuackClientConnection> GetClientConnection();
+	shared_ptr<QuackClientConnection> GetConnectClientConnection(ClientContext &context);
 
 	void Refresh(ClientContext &context);
 
@@ -87,13 +94,18 @@ private:
 
 	//! Build the "quack_query_by_name" table function call that runs "sql" on the server. Statements pushed
 	//! down by the RemotePushdownOptimizer change the remote catalog, so they ask for a catalog refresh
-	unique_ptr<TableRef> CreateRemoteQueryRef(const string &sql, bool refresh_catalog, bool use_transaction = true);
+	unique_ptr<TableRef> CreateRemoteQueryRef(const string &sql, bool refresh_catalog, bool use_transaction = true,
+	                                        const identifier_map_t<BoundParameterData> *parameters = nullptr,
+	                                        bool connect_session = false);
 
 	QuackLoadCatalogData LoadCatalog(ClientContext &context);
 
 private:
 	shared_ptr<QuackClientConnection> client_connection;
 	unique_ptr<QuackSchemaSet> schemas;
+	string auth_token;
+	string client_identifier;
+	idx_t requested_heartbeat_timeout;
 };
 
 } // namespace duckdb

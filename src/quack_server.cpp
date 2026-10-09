@@ -11,6 +11,9 @@
 
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/main/prepared_statement.hpp"
+#include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 
 #include "quack_server.hpp"
 #include "quack_message.hpp"
@@ -124,7 +127,8 @@ static void SyncResultCache(QuackConnection &connection, QuackResultStream &stre
 //! Runs one client statement with the result collector installed. It holds the statement lock for the
 //! full duration. A statement that returns rows fills the claim buffer in parallel. A statement that
 //! returns a count leaves the count in batch 1, through the fallback below.
-static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream> stream, string sql) {
+static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream> stream, string sql,
+                       identifier_map_t<BoundParameterData> parameters) {
 	// A failed statement must stop the client's sends, so its scan's streams get the error too.
 	auto fail_streams = [&](const ErrorData &error) {
 		if (auto session_state = QuackSessionState::Get(*connection.duckdb_connection->context)) {
@@ -143,7 +147,13 @@ static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream
 		};
 		unique_ptr<QueryResult> result;
 		try {
-			result = connection.duckdb_connection->Query(sql);
+			if (parameters.empty()) {
+				result = connection.duckdb_connection->Query(sql);
+			} else {
+				auto pending = connection.duckdb_connection->PendingQuery(sql, parameters);
+				result = pending->HasError() ? make_uniq<MaterializedQueryResult>(pending->GetErrorObject())
+				                            : pending->Execute();
+			}
 		} catch (...) {
 			// leave no collector hook on the connection's config
 			config.get_result_collector = nullptr;
@@ -167,7 +177,9 @@ static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream
 			for (auto &col_name : result->GetNames()) {
 				result_names.push_back(col_name.GetIdentifierName());
 			}
-			stream->SignalBound(result->GetTypes(), std::move(result_names));
+			stream->SignalBound(result->GetTypes(), std::move(result_names),
+			                    make_uniq<QuackPreparedMetadata>(result->GetStatementType(),
+			                                                     result->GetStatementProperties()));
 			unique_ptr<QuackChunkPayloadWriter> writer;
 			idx_t rows = 0;
 			while (auto chunk = result->Fetch()) {
@@ -628,9 +640,43 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		}
 		auto effective_sql = (authz.value.type().id() == LogicalTypeId::VARCHAR) ? authz.value.GetValue<string>()
 		                                                                         : prepare_request_message.Query();
+		if (prepare_request_message.TransactionStateOnly()) {
+			// A read-only control probe must not abort or replace the session's current result stream.
+			auto response = make_uniq<PrepareResponseMessage>(vector<LogicalType>(), vector<string>(),
+			    vector<unique_ptr<DataChunkWrapper>>(), false, hugeint_t {0, 0});
+			response->SetRemoteAutoCommit(connection.duckdb_connection->IsAutoCommit());
+			return response;
+		}
 
 		// Stop the previous producer first. This joins its thread, so it frees the statement lock.
 		AbortStatement(connection, "superseded by a new query");
+		if (prepare_request_message.PrepareOnly()) {
+			unique_lock<mutex> guard(connection.statement_lock);
+			auto prepared = connection.duckdb_connection->Prepare(effective_sql);
+			if (prepared->HasError()) {
+				return make_uniq<ErrorResponse>(prepared->GetErrorObject());
+			}
+			vector<string> result_names;
+			for (auto &name : prepared->GetNames()) {
+				result_names.push_back(name.GetIdentifierName());
+			}
+			auto response = make_uniq<PrepareResponseMessage>(prepared->GetTypes(), result_names,
+			    vector<unique_ptr<DataChunkWrapper>>(), false, hugeint_t {0, 0});
+			response->SetPreparedMetadata(make_uniq<QuackPreparedMetadata>(*prepared));
+			return response;
+		}
+		if (prepare_request_message.ParameterNames().size() != prepare_request_message.ParameterValues().size()) {
+			return make_uniq<ErrorResponse>(ErrorData(ExceptionType::INVALID_INPUT,
+			    "Quack parameter names and values must have equal lengths"));
+		}
+		identifier_map_t<BoundParameterData> parameters;
+		for (idx_t i = 0; i < prepare_request_message.ParameterNames().size(); i++) {
+			auto inserted = parameters.emplace(Identifier(prepare_request_message.ParameterNames()[i]),
+			                                   BoundParameterData(prepare_request_message.ParameterValues()[i]));
+			if (!inserted.second) {
+				return make_uniq<ErrorResponse>(ErrorData(ExceptionType::INVALID_INPUT, "Duplicate Quack parameter"));
+			}
+		}
 		{
 			std::unique_lock<std::mutex> lock(connection.lock);
 			if (prepare_request_message.QueryUUID() != hugeint_t {0, 0}) {
@@ -675,7 +721,8 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			if (auto session_state = QuackSessionState::Get(*connection.duckdb_connection->context)) {
 				session_state->SetStatement(stream);
 			}
-			connection.statement.thread = std::thread(DriveQuery, std::ref(connection), stream, effective_sql);
+			connection.statement.thread =
+			    std::thread(DriveQuery, std::ref(connection), stream, effective_sql, std::move(parameters));
 		}
 		AbortDetachedStatement(connection, std::move(superseded), "superseded by a new query");
 
@@ -755,8 +802,12 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		if (!needs_more_fetch) {
 			connection.query_state = QuackQueryState::FINISHED;
 		}
-		return make_uniq<PrepareResponseMessage>(stream->types, stream->names, std::move(results), needs_more_fetch,
-		                                         prepare_request_message.QueryUUID());
+		auto response = make_uniq<PrepareResponseMessage>(stream->types, stream->names, std::move(results), needs_more_fetch,
+		                                                prepare_request_message.QueryUUID());
+		if (stream->metadata) {
+			response->SetPreparedMetadata(make_uniq<QuackPreparedMetadata>(*stream->metadata));
+		}
+		return response;
 	}
 
 	case MessageType::FETCH_REQUEST: {

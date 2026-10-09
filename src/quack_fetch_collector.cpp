@@ -195,7 +195,8 @@ unique_ptr<PhysicalOperator> MakeQuackFetchCollector(ClientContext &context, Pre
 	for (auto &name : data.names) {
 		result_names.push_back(name.GetIdentifierName());
 	}
-	stream->SignalBound(data.types, std::move(result_names));
+	stream->SignalBound(data.types, std::move(result_names),
+	                    make_uniq<QuackPreparedMetadata>(data.statement_type, data.properties));
 	return make_uniq<QuackFetchCollector>(physical_plan, data, std::move(stream), order_mode);
 }
 

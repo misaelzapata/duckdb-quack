@@ -77,11 +77,15 @@ unique_ptr<DisconnectMessage> DisconnectMessage::Deserialize(Deserializer &deser
 
 void ErrorResponse::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "message", error.RawMessage());
+	serializer.WritePropertyWithDefault<ExceptionType>(2, "error_type", error.Type(), ExceptionType::INVALID_INPUT);
+	serializer.WritePropertyWithDefault<unordered_map<string, string>>(3, "extra_info", error.ExtraInfo());
 }
 
 unique_ptr<ErrorResponse> ErrorResponse::Deserialize(Deserializer &deserializer) {
 	auto message = deserializer.ReadPropertyWithDefault<string>(1, "message");
-	auto result = duckdb::unique_ptr<ErrorResponse>(new ErrorResponse(std::move(message)));
+	auto error_type = deserializer.ReadPropertyWithExplicitDefault<ExceptionType>(2, "error_type", ExceptionType::INVALID_INPUT);
+	auto extra_info = deserializer.ReadPropertyWithDefault<unordered_map<string, string>>(3, "extra_info");
+	auto result = duckdb::unique_ptr<ErrorResponse>(new ErrorResponse(error_type, std::move(message), std::move(extra_info)));
 	return result;
 }
 
@@ -108,8 +112,7 @@ void FetchResponseMessage::Serialize(Serializer &serializer) const {
 unique_ptr<FetchResponseMessage> FetchResponseMessage::Deserialize(Deserializer &deserializer) {
 	auto result = duckdb::unique_ptr<FetchResponseMessage>(new FetchResponseMessage());
 	deserializer.ReadPropertyWithExplicitDefault<idx_t>(1, "chunk_count", result->chunk_count, 0);
-	deserializer.ReadPropertyWithExplicitDefault<optional_idx>(2, "total_batches", result->total_batches,
-	                                                           optional_idx());
+	deserializer.ReadPropertyWithExplicitDefault<optional_idx>(2, "total_batches", result->total_batches, optional_idx());
 	deserializer.ReadPropertyWithExplicitDefault<optional_idx>(3, "batch_index", result->batch_index, optional_idx());
 	return result;
 }
@@ -140,6 +143,10 @@ void PrepareRequestMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<string>(1, "sql_query", sql_query);
 	serializer.WriteProperty<hugeint_t>(2, "query_uuid", query_uuid);
 	serializer.WritePropertyWithDefault<optional_idx>(3, "inline_rows", inline_rows, optional_idx());
+	serializer.WritePropertyWithDefault<vector<string>>(4, "parameter_names", parameter_names);
+	serializer.WritePropertyWithDefault<vector<Value>>(5, "parameter_values", parameter_values);
+	serializer.WritePropertyWithDefault<bool>(6, "prepare_only", prepare_only);
+	serializer.WritePropertyWithDefault<bool>(7, "transaction_state_only", transaction_state_only);
 }
 
 unique_ptr<PrepareRequestMessage> PrepareRequestMessage::Deserialize(Deserializer &deserializer) {
@@ -147,6 +154,10 @@ unique_ptr<PrepareRequestMessage> PrepareRequestMessage::Deserialize(Deserialize
 	deserializer.ReadPropertyWithDefault<string>(1, "sql_query", result->sql_query);
 	deserializer.ReadProperty<hugeint_t>(2, "query_uuid", result->query_uuid);
 	deserializer.ReadPropertyWithExplicitDefault<optional_idx>(3, "inline_rows", result->inline_rows, optional_idx());
+	deserializer.ReadPropertyWithDefault<vector<string>>(4, "parameter_names", result->parameter_names);
+	deserializer.ReadPropertyWithDefault<vector<Value>>(5, "parameter_values", result->parameter_values);
+	deserializer.ReadPropertyWithDefault<bool>(6, "prepare_only", result->prepare_only);
+	deserializer.ReadPropertyWithDefault<bool>(7, "transaction_state_only", result->transaction_state_only);
 	return result;
 }
 
@@ -156,6 +167,8 @@ void PrepareResponseMessage::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<bool>(3, "needs_more_fetch", needs_more_fetch);
 	serializer.WritePropertyWithDefault<vector<unique_ptr<DataChunkWrapper>>>(4, "results", results);
 	serializer.WriteProperty<hugeint_t>(5, "query_uuid", query_uuid);
+	serializer.WritePropertyWithDefault<unique_ptr<QuackPreparedMetadata>>(6, "prepared_metadata", prepared_metadata);
+	serializer.WritePropertyWithDefault<bool>(7, "remote_auto_commit", remote_auto_commit, true);
 }
 
 unique_ptr<PrepareResponseMessage> PrepareResponseMessage::Deserialize(Deserializer &deserializer) {
@@ -164,8 +177,37 @@ unique_ptr<PrepareResponseMessage> PrepareResponseMessage::Deserialize(Deseriali
 	auto needs_more_fetch = deserializer.ReadPropertyWithDefault<bool>(3, "needs_more_fetch");
 	auto results = deserializer.ReadPropertyWithDefault<vector<unique_ptr<DataChunkWrapper>>>(4, "results");
 	auto query_uuid = deserializer.ReadProperty<hugeint_t>(5, "query_uuid");
-	auto result = duckdb::unique_ptr<PrepareResponseMessage>(new PrepareResponseMessage(
-	    std::move(result_types), std::move(result_names), std::move(results), needs_more_fetch, query_uuid));
+	auto result = duckdb::unique_ptr<PrepareResponseMessage>(new PrepareResponseMessage(std::move(result_types), std::move(result_names), std::move(results), needs_more_fetch, query_uuid));
+	deserializer.ReadPropertyWithDefault<unique_ptr<QuackPreparedMetadata>>(6, "prepared_metadata", result->prepared_metadata);
+	deserializer.ReadPropertyWithExplicitDefault<bool>(7, "remote_auto_commit", result->remote_auto_commit, true);
+	return result;
+}
+
+void QuackPreparedMetadata::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<StatementType>(1, "statement_type", statement_type);
+	serializer.WritePropertyWithDefault<vector<string>>(2, "parameter_names", parameter_names);
+	serializer.WritePropertyWithDefault<vector<LogicalType>>(3, "parameter_types", parameter_types);
+	serializer.WritePropertyWithDefault<bool>(4, "requires_valid_transaction", requires_valid_transaction);
+	serializer.WriteProperty<QueryResultOutputType>(5, "output_type", output_type);
+	serializer.WritePropertyWithDefault<bool>(6, "bound_all_parameters", bound_all_parameters);
+	serializer.WriteProperty<StatementReturnType>(7, "return_type", return_type);
+	serializer.WritePropertyWithDefault<idx_t>(8, "parameter_count", parameter_count);
+	serializer.WritePropertyWithDefault<bool>(9, "always_require_rebind", always_require_rebind);
+	serializer.WritePropertyWithDefault<bool>(10, "read_only", read_only);
+}
+
+unique_ptr<QuackPreparedMetadata> QuackPreparedMetadata::Deserialize(Deserializer &deserializer) {
+	auto result = duckdb::unique_ptr<QuackPreparedMetadata>(new QuackPreparedMetadata());
+	deserializer.ReadProperty<StatementType>(1, "statement_type", result->statement_type);
+	deserializer.ReadPropertyWithDefault<vector<string>>(2, "parameter_names", result->parameter_names);
+	deserializer.ReadPropertyWithDefault<vector<LogicalType>>(3, "parameter_types", result->parameter_types);
+	deserializer.ReadPropertyWithDefault<bool>(4, "requires_valid_transaction", result->requires_valid_transaction);
+	deserializer.ReadProperty<QueryResultOutputType>(5, "output_type", result->output_type);
+	deserializer.ReadPropertyWithDefault<bool>(6, "bound_all_parameters", result->bound_all_parameters);
+	deserializer.ReadProperty<StatementReturnType>(7, "return_type", result->return_type);
+	deserializer.ReadPropertyWithDefault<idx_t>(8, "parameter_count", result->parameter_count);
+	deserializer.ReadPropertyWithDefault<bool>(9, "always_require_rebind", result->always_require_rebind);
+	deserializer.ReadPropertyWithDefault<bool>(10, "read_only", result->read_only);
 	return result;
 }
 
@@ -180,8 +222,7 @@ unique_ptr<SendDataRequestMessage> SendDataRequestMessage::Deserialize(Deseriali
 	auto result = duckdb::unique_ptr<SendDataRequestMessage>(new SendDataRequestMessage());
 	deserializer.ReadPropertyWithDefault<string>(1, "stream_id", result->stream_id);
 	deserializer.ReadPropertyWithExplicitDefault<idx_t>(2, "chunk_count", result->chunk_count, 0);
-	deserializer.ReadPropertyWithExplicitDefault<optional_idx>(3, "total_batches", result->total_batches,
-	                                                           optional_idx());
+	deserializer.ReadPropertyWithExplicitDefault<optional_idx>(3, "total_batches", result->total_batches, optional_idx());
 	deserializer.ReadPropertyWithExplicitDefault<optional_idx>(4, "batch_index", result->batch_index, optional_idx());
 	return result;
 }

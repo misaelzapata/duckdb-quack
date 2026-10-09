@@ -4,7 +4,7 @@
     "includes": [
       "quack_message.hpp"
     ],
-    "members":  [
+    "members": [
       {
         "id": 1,
         "name": "type",
@@ -22,7 +22,10 @@
       }
     ],
     "pointer_type": "none",
-    "constructor": ["type", "connection_id"]
+    "constructor": [
+      "type",
+      "connection_id"
+    ]
   },
   {
     "class": "ErrorResponse",
@@ -32,9 +35,26 @@
         "name": "message",
         "type": "string",
         "serialize_property": "error.RawMessage()"
+      },
+      {
+        "id": 2,
+        "name": "error_type",
+        "type": "ExceptionType",
+        "serialize_property": "error.Type()",
+        "default": "ExceptionType::INVALID_INPUT"
+      },
+      {
+        "id": 3,
+        "name": "extra_info",
+        "type": "unordered_map<string, string>",
+        "serialize_property": "error.ExtraInfo()"
       }
     ],
-    "constructor": ["message"]
+    "constructor": [
+      "error_type",
+      "message",
+      "extra_info"
+    ]
   },
   {
     "class": "PrepareRequestMessage",
@@ -54,6 +74,26 @@
         "name": "inline_rows",
         "type": "optional_idx",
         "default": "optional_idx()"
+      },
+      {
+        "id": 4,
+        "name": "parameter_names",
+        "type": "vector<string>"
+      },
+      {
+        "id": 5,
+        "name": "parameter_values",
+        "type": "vector<Value>"
+      },
+      {
+        "id": 6,
+        "name": "prepare_only",
+        "type": "bool"
+      },
+      {
+        "id": 7,
+        "name": "transaction_state_only",
+        "type": "bool"
       }
     ]
   },
@@ -114,9 +154,26 @@
         "id": 5,
         "name": "query_uuid",
         "type": "hugeint_t"
+      },
+      {
+        "id": 6,
+        "name": "prepared_metadata",
+        "type": "unique_ptr<QuackPreparedMetadata>"
+      },
+      {
+        "id": 7,
+        "name": "remote_auto_commit",
+        "type": "bool",
+        "default": "true"
       }
     ],
-    "constructor": ["result_types", "result_names",  "results", "needs_more_fetch", "query_uuid"]
+    "constructor": [
+      "result_types",
+      "result_names",
+      "results",
+      "needs_more_fetch",
+      "query_uuid"
+    ]
   },
   {
     "class": "SendDataRequestMessage",
@@ -266,6 +323,61 @@
         "name": "query_uuid",
         "type": "hugeint_t",
         "default": "hugeint_t(0, 0)"
+      }
+    ]
+  },
+  {
+    "class": "QuackPreparedMetadata",
+    "members": [
+      {
+        "id": 1,
+        "name": "statement_type",
+        "type": "StatementType"
+      },
+      {
+        "id": 2,
+        "name": "parameter_names",
+        "type": "vector<string>"
+      },
+      {
+        "id": 3,
+        "name": "parameter_types",
+        "type": "vector<LogicalType>"
+      },
+      {
+        "id": 4,
+        "name": "requires_valid_transaction",
+        "type": "bool"
+      },
+      {
+        "id": 5,
+        "name": "output_type",
+        "type": "QueryResultOutputType"
+      },
+      {
+        "id": 6,
+        "name": "bound_all_parameters",
+        "type": "bool"
+      },
+      {
+        "id": 7,
+        "name": "return_type",
+        "type": "StatementReturnType"
+      },
+      {
+        "id": 8,
+        "name": "parameter_count",
+        "type": "idx_t"
+      },
+      {
+        "id": 9,
+        "name": "always_require_rebind",
+        "type": "bool"
+      },
+      {
+        "id": 10,
+        "name": "read_only",
+        "type": "bool"
       }
     ]
   }

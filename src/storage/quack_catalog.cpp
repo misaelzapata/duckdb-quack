@@ -1,5 +1,8 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/prepared_statement.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -26,9 +29,56 @@
 
 namespace duckdb {
 
+//! Catalogs are shared by duplicate DuckDB connections; SQL sessions must not be shared.
+class QuackConnectState : public ClientContextState {
+public:
+	static constexpr const char *KEY = "quack_connect_sessions";
+	mutex lock;
+	unordered_map<idx_t, shared_ptr<QuackClientConnection>> sessions;
+	unique_ptr<QuackPreparedMetadata> result_metadata;
+	vector<Identifier> result_names;
+
+	bool CanRequestRebind() override {
+		return true;
+	}
+	void QueryBegin(ClientContext &context) override {
+		result_metadata.reset();
+		result_names.clear();
+	}
+	RebindQueryInfo OnFinalizePrepare(ClientContext &context, PreparedStatementData &statement,
+	                                  PreparedStatementMode mode) override {
+		if (result_metadata && context.IsConnected()) {
+			if (result_names.size() != statement.names.size()) {
+				throw InternalException("Quack result names do not match the local transport schema");
+			}
+			// The local SELECT is only a transport plan. Native clients must see the original SQL's result metadata.
+			statement.names = std::move(result_names);
+			statement.statement_type = result_metadata->statement_type;
+			statement.properties.return_type = result_metadata->return_type;
+			statement.properties.output_type = result_metadata->output_type;
+			result_metadata.reset();
+		}
+		return RebindQueryInfo::DO_NOT_REBIND;
+	}
+
+	void ConnectionClosed() override {
+		unordered_map<idx_t, shared_ptr<QuackClientConnection>> closing;
+		{
+			lock_guard<mutex> guard(lock);
+			closing.swap(sessions);
+		}
+		for (auto &entry : closing) {
+			entry.second->Disconnect();
+		}
+	}
+};
+
 QuackCatalog::QuackCatalog(AttachedDatabase &db_p, const QuackUri &server_uri, ClientContext &context,
                            const string &token, string client_id, idx_t heartbeat_timeout_seconds)
     : Catalog(db_p) {
+	auth_token = token;
+	client_identifier = client_id;
+	requested_heartbeat_timeout = heartbeat_timeout_seconds;
 	// connect to the server
 	client_connection =
 	    QuackClient::ConnectToServer(context, server_uri, token, std::move(client_id), heartbeat_timeout_seconds);
@@ -116,6 +166,17 @@ unique_ptr<ColumnDataCollection> QuackCatalog::ExecuteCommandInternal(ClientCont
 
 shared_ptr<QuackClientConnection> QuackCatalog::GetClientConnection() {
 	return client_connection;
+}
+
+shared_ptr<QuackClientConnection> QuackCatalog::GetConnectClientConnection(ClientContext &context) {
+	auto state = context.registered_state->GetOrCreate<QuackConnectState>(QuackConnectState::KEY);
+	lock_guard<mutex> guard(state->lock);
+	auto &session = state->sessions[GetOid()];
+	if (!session) {
+		session = QuackClient::ConnectToServer(context, GetServerUri(), auth_token, client_identifier,
+		                                       requested_heartbeat_timeout);
+	}
+	return session;
 }
 
 void QuackCatalog::Refresh(ClientContext &context) {
@@ -217,21 +278,98 @@ unique_ptr<TableRef> QuackCatalog::RemoteExecute(ClientContext &context, unique_
 }
 
 unique_ptr<TableRef> QuackCatalog::RemoteExecute(ClientContext &context, const string &sql) {
-	// CONNECT forwards statements verbatim - no synthesized transaction, or a forwarded BEGIN would
-	// land inside it and COMMIT/ROLLBACK arrive after it has closed
-	return CreateRemoteQueryRef(sql, false, false);
+	// Forward transaction control verbatim, using this ClientContext's independent server session.
+	GetConnectClientConnection(context);
+	return CreateRemoteQueryRef(sql, false, false, nullptr, true);
+}
+
+unique_ptr<TableRef> QuackCatalog::RemoteExecute(ClientContext &context, const string &sql,
+                                               const identifier_map_t<BoundParameterData> &parameters) {
+	GetConnectClientConnection(context);
+	return CreateRemoteQueryRef(sql, false, false, &parameters, true);
+}
+
+void QuackCatalog::SetConnectQueryMetadata(ClientContext &context, const PrepareResponseMessage &response) {
+	auto metadata = response.PreparedMetadata();
+	if (!metadata) {
+		throw InvalidInputException("The Quack server did not return native execution metadata; use the matching build");
+	}
+	auto state = context.registered_state->GetOrCreate<QuackConnectState>(QuackConnectState::KEY);
+	state->result_metadata = make_uniq<QuackPreparedMetadata>(*metadata);
+	state->result_names.clear();
+	for (auto &name : response.Names()) {
+		state->result_names.push_back(Identifier(name));
+	}
+}
+
+PreparedStatementInfo QuackCatalog::RemotePrepare(ClientContext &context, SQLStatement &statement) {
+	auto session = GetConnectClientConnection(context);
+	auto client = session->GetClient(context);
+	auto request = make_uniq<PrepareRequestMessage>(session->ConnectionId(), statement.query, hugeint_t {0, 0});
+	request->SetPrepareOnly(true);
+	auto response = client->GetClient().Request<PrepareResponseMessage>(context, std::move(request));
+	auto metadata = response->PreparedMetadata();
+	if (!metadata || metadata->parameter_names.size() != metadata->parameter_types.size()) {
+		throw IOException("Quack server did not return valid prepared-statement metadata");
+	}
+	PreparedStatementInfo info;
+	info.statement_type = metadata->statement_type;
+	info.types = response->Types();
+	for (auto &name : response->Names()) {
+		info.names.push_back(Identifier(name));
+	}
+	info.named_param_map = statement.named_param_map;
+	for (idx_t i = 0; i < metadata->parameter_names.size(); i++) {
+		info.parameter_types.emplace(Identifier(metadata->parameter_names[i]), metadata->parameter_types[i]);
+	}
+	info.properties.requires_valid_transaction = metadata->requires_valid_transaction;
+	info.properties.output_type = metadata->output_type;
+	info.properties.bound_all_parameters = metadata->bound_all_parameters;
+	info.properties.return_type = metadata->return_type;
+	info.properties.parameter_count = metadata->parameter_count;
+	info.properties.always_require_rebind = metadata->always_require_rebind;
+	if (!metadata->read_only) {
+		// Remote catalog identity is deliberately represented by the client-side attachment.
+		info.properties.modified_databases[GetName()] = {{GetOid(), {}}, DatabaseModificationType()};
+	}
+	return info;
+}
+
+bool QuackCatalog::RemoteIsAutoCommit(ClientContext &context) {
+	auto session = GetConnectClientConnection(context);
+	auto client = session->GetClient(context);
+	auto request = make_uniq<PrepareRequestMessage>(session->ConnectionId(), "COMMIT", hugeint_t {0, 0});
+	request->SetTransactionStateOnly(true);
+	auto response = client->GetClient().Request<PrepareResponseMessage>(context, std::move(request));
+	return response->RemoteAutoCommit();
 }
 
 unique_ptr<TableRef> QuackCatalog::CreateRemoteQueryRef(const string &sql, bool refresh_catalog,
-                                                        bool use_transaction_p) {
+                                                      bool use_transaction_p,
+                                                      const identifier_map_t<BoundParameterData> *parameters,
+                                                      bool connect_session) {
 	vector<unique_ptr<ParsedExpression>> args;
-	args.push_back(make_uniq<ConstantExpression>(Value(GetName())));
-	args.push_back(make_uniq<ConstantExpression>(Value(sql)));
-	auto use_transaction = make_uniq<ConstantExpression>(Value::BOOLEAN(use_transaction_p));
+	args.push_back(ConstantExpression::FromValue(Value(GetName())));
+	args.push_back(ConstantExpression::FromValue(Value(sql)));
+	auto use_transaction = ConstantExpression::FromValue(Value::BOOLEAN(use_transaction_p));
 	use_transaction->SetAlias("use_transaction");
 	args.push_back(std::move(use_transaction));
+	if (connect_session) {
+		auto session = ConstantExpression::FromValue(Value::BOOLEAN(true));
+		session->SetAlias("connect_session");
+		args.push_back(std::move(session));
+	}
+	if (parameters && !parameters->empty()) {
+		child_list_t<Value> fields;
+		for (auto &entry : *parameters) {
+			fields.emplace_back(entry.first.GetIdentifierName(), entry.second.GetValue());
+		}
+		auto values = ConstantExpression::FromValue(Value::STRUCT(std::move(fields)));
+		values->SetAlias("parameters");
+		args.push_back(std::move(values));
+	}
 	if (refresh_catalog) {
-		auto refresh = make_uniq<ConstantExpression>(Value::BOOLEAN(true));
+		auto refresh = ConstantExpression::FromValue(Value::BOOLEAN(true));
 		refresh->SetAlias("refresh_catalog");
 		args.push_back(std::move(refresh));
 	}

@@ -125,7 +125,7 @@ idx_t QuackFetcher::GetReadAheadDepth(ClientContext &context) {
 
 QuackFetcher::QuackFetcher(ClientContext &context, QuackClientConnection &connection, hugeint_t query_uuid,
                            idx_t depth_p)
-    : depth(MaxValue<idx_t>(depth_p, 1)) {
+    : client_connection(connection.shared_from_this()), depth(MaxValue<idx_t>(depth_p, 1)) {
 	queue = make_uniq<ManagedAsyncTaskQueue>(context, depth);
 	if (!queue->IsAsync()) {
 		// Register runs the POST inline on the scan thread; deeper pipelining is impossible.
@@ -264,9 +264,16 @@ void QuackFetcher::FinishTask(unique_ptr<QuackClientWrapper> client, bool pushed
 	}
 }
 
-void QuackFetcher::StopAndDrain() {
+void QuackFetcher::StopAndDrain(bool cancel_pending) {
 	stop = true;
 	if (queue) {
+		if (cancel_pending && !no_more_fetches) {
+			try {
+				client_connection->CancelQuery(query_uuid);
+			} catch (...) {
+				// A dead peer must not prevent the asynchronous queue from being joined.
+			}
+		}
 		try {
 			queue->Close();
 		} catch (...) {

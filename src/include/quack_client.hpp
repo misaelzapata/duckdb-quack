@@ -104,6 +104,8 @@ public:
 	                               string connection_id_p, idx_t heartbeat_timeout_seconds_p,
 	                               idx_t max_connections_cached = 1);
 	~QuackClientConnection();
+	//! Release the server session immediately, even when a relation still holds this object.
+	void Disconnect();
 
 	void CancelQuery(hugeint_t query_uuid);
 
@@ -141,6 +143,7 @@ private:
 	mutable vector<unique_ptr<QuackClient>> cached_clients;
 
 	QuackPeriodicWorker heartbeat;
+	atomic<bool> disconnected {false};
 };
 
 struct QuackClientWrapper {

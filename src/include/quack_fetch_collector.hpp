@@ -12,6 +12,7 @@
 #include "duckdb/common/serializer/memory_stream.hpp"
 
 #include "quack_claim_buffer.hpp"
+#include "quack_message.hpp"
 
 #include <condition_variable>
 
@@ -38,11 +39,13 @@ using QuackFetchPayloadBuffer = QuackClaimBuffer<QuackFetchPayload>;
 struct QuackResultStream {
 	QuackFetchPayloadBuffer buffer;
 
-	void SignalBound(vector<LogicalType> types_p, vector<string> names_p) {
+	void SignalBound(vector<LogicalType> types_p, vector<string> names_p,
+	                 unique_ptr<QuackPreparedMetadata> metadata_p = nullptr) {
 		{
 			lock_guard<mutex> guard(bind_lock);
 			types = std::move(types_p);
 			names = std::move(names_p);
+			metadata = std::move(metadata_p);
 			bound = true;
 		}
 		bind_cv.notify_all();
@@ -75,6 +78,7 @@ struct QuackResultStream {
 
 	vector<LogicalType> types;
 	vector<string> names;
+	unique_ptr<QuackPreparedMetadata> metadata;
 	bool client_data_pending = false;
 	//! The dense batches PREPARE consumed inline. FETCH subtracts this, so the client-facing indices
 	//! stay dense from 1. PREPARE writes it before the first FETCH arrives.

@@ -25,12 +25,10 @@ string GetUriPart(T ele) {
 }
 
 void QuackClientConnection::CancelQuery(hugeint_t query_uuid) {
-	lock_guard<mutex> guard(lock);
-	if (cached_clients.empty()) {
-		return;
-	}
-	// get a cached client, if any
-	auto &client = cached_clients.back();
+	// FETCH may hold every cached client. TakeClient can open another without holding the pool lock
+	// over the request, so cancellation never waits for the query it is supposed to interrupt.
+	auto client = TakeClient(nullptr);
+	client->PrepareTeardownRequest();
 	client->Request<SuccessResponse>(nullptr, make_uniq<CancelRequestMessage>(connection_id, query_uuid));
 }
 
@@ -121,6 +119,8 @@ void HttpsQuackClient::EnsureHttpParams(optional_ptr<ClientContext> context) {
 		} else {
 			http_params = http_util.InitializeParameters(db, request_url);
 		}
+		// Replaying a PREPARE after a lost reply could execute a committed write twice.
+		http_params->retries = 0;
 	}
 	// http_params is cached across checkouts; re-scope its logger each request so a context-less
 	// teardown on a pooled client never logs under a prior query's scope.
@@ -200,16 +200,20 @@ QuackClientConnection::QuackClientConnection(DatabaseInstance &db_p, unique_ptr<
 }
 
 QuackClientConnection::~QuackClientConnection() {
+	Disconnect();
+}
+
+void QuackClientConnection::Disconnect() {
+	if (disconnected.exchange(true)) {
+		return;
+	}
 	heartbeat.Stop();
-	if (!cached_clients.empty()) {
-		try {
-			auto &client = cached_clients.back();
-			// A dead peer at teardown must not block the destructor for the full request timeout (which
-			// task dispatch may have set to an hour). Bound the transport first.
-			client->PrepareTeardownRequest();
-			client->Request<SuccessResponse>(nullptr, make_uniq<DisconnectMessage>(connection_id));
-		} catch (...) {
-		}
+	try {
+		auto client = TakeClient(nullptr);
+		// A dead peer at teardown must not block the destructor for the full request timeout.
+		client->PrepareTeardownRequest();
+		client->Request<SuccessResponse>(nullptr, make_uniq<DisconnectMessage>(connection_id));
+	} catch (...) {
 	}
 }
 

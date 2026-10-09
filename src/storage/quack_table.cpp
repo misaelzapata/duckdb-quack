@@ -6,7 +6,9 @@
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/constraint.hpp"
 #include "storage/quack_view.hpp"
 
 namespace duckdb {
@@ -47,6 +49,21 @@ QuackTableSet::QuackTableSet(ClientContext &context, QuackSchemaCatalogEntry &pa
 			// the entire ATTACH with a misleading "Catalog \"...\" does not exist" (issue #132).
 			// The parsed DEFAULT stays on the column and binds on first use, once the catalog exists.
 			auto binder = Binder::CreateBinder(context);
+			// Foreign keys are already resolved and enforced by the server. During
+			// ATTACH this local catalog is not registered yet, so rebinding a foreign
+			// key here cannot look up its referenced table. Keep the parsed metadata
+			// while binding column types and the other local constraints.
+			auto &table_info = info->Cast<CreateTableInfo>();
+			vector<unique_ptr<Constraint>> foreign_keys;
+			vector<unique_ptr<Constraint>> local_constraints;
+			for (auto &constraint : table_info.constraints) {
+				if (constraint->type == ConstraintType::FOREIGN_KEY) {
+					foreign_keys.push_back(std::move(constraint));
+				} else {
+					local_constraints.push_back(std::move(constraint));
+				}
+			}
+			table_info.constraints = std::move(local_constraints);
 			unique_ptr<BoundCreateTableInfo> bound_info;
 			try {
 				bound_info = binder->BindCreateTableInfo(std::move(info), schema, AlterBindMode::SKIP_BINDING);
@@ -54,6 +71,9 @@ QuackTableSet::QuackTableSet(ClientContext &context, QuackSchemaCatalogEntry &pa
 				throw BinderException(
 				    "Failed to bind remote table while attaching quack catalog \"%s\" (schema \"%s\"): %s\nSQL: %s",
 				    catalog.GetName().GetIdentifierName(), schema.name.GetIdentifierName(), ex.what(), sql);
+			}
+			for (auto &foreign_key : foreign_keys) {
+				bound_info->Base().constraints.push_back(std::move(foreign_key));
 			}
 			auto table = make_uniq<QuackTableCatalogEntry>(catalog, parent, bound_info->Base());
 			entry = std::move(table);

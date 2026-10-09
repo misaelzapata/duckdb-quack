@@ -104,17 +104,45 @@ static unique_ptr<FunctionData> QuackScanBindCatalogName(ClientContext &context,
 	// TODO some of this stuff below is duplicated af
 	auto query = input.inputs[1].GetValue<string>();
 	auto bind_data = make_uniq<QuackScanBindData>();
-	bind_data->client_connection = catalog.GetClientConnection();
+	auto session_entry = input.named_parameters.find("connect_session");
+	bool connect_session = session_entry != input.named_parameters.end() && BooleanValue::Get(session_entry->second);
+	bind_data->client_connection =
+	    connect_session ? catalog.GetConnectClientConnection(context) : catalog.GetClientConnection();
 	auto client_wrapper = bind_data->client_connection->GetClient(context);
 	auto &client = client_wrapper->GetClient();
 	bind_data->query_uuid = UUID::GenerateRandomUUID();
-	auto bind_response = client.Request<PrepareResponseMessage>(
-	    context,
-	    make_uniq<PrepareRequestMessage>(bind_data->client_connection->ConnectionId(), query, bind_data->query_uuid));
+	auto request =
+	    make_uniq<PrepareRequestMessage>(bind_data->client_connection->ConnectionId(), query, bind_data->query_uuid);
+	if (connect_session) {
+		// Return bound schema before computation; native execution can then observe interrupts.
+		request->SetInlineRows(optional_idx(0));
+	}
+	auto parameter_entry = input.named_parameters.find("parameters");
+	if (parameter_entry != input.named_parameters.end()) {
+		auto &parameters = parameter_entry->second;
+		if (parameters.IsNull() || parameters.type().id() != LogicalTypeId::STRUCT) {
+			throw InvalidInputException("Quack typed parameters must be a non-null STRUCT");
+		}
+		vector<string> parameter_names;
+		auto values = StructValue::GetChildren(parameters);
+		for (idx_t i = 0; i < values.size(); i++) {
+			parameter_names.push_back(StructType::GetChildName(parameters.type(), i).GetIdentifierName());
+		}
+		request->SetParameters(std::move(parameter_names), std::move(values));
+	}
+	auto bind_response = client.Request<PrepareResponseMessage>(context, std::move(request));
 
 	return_types = bind_response->Types();
-	for (auto &col_name : bind_response->Names()) {
-		names.push_back(Identifier(col_name));
+	if (connect_session) {
+		QuackCatalog::SetConnectQueryMetadata(context, *bind_response);
+		for (idx_t i = 0; i < bind_response->Names().size(); i++) {
+			// These names only bind SELECT * over the transport; public result names are restored after planning.
+			names.push_back(Identifier("__quack_transport_" + std::to_string(i)));
+		}
+	} else {
+		for (auto &col_name : bind_response->Names()) {
+			names.push_back(Identifier(col_name));
+		}
 	}
 
 	// new stuff
@@ -370,7 +398,7 @@ static void FinishScan(ClientContext &context, QuackScanGlobalState &global_stat
 		return;
 	}
 	if (global_state.fetcher) {
-		global_state.fetcher->StopAndDrain();
+		global_state.fetcher->StopAndDrain(false);
 	}
 	SendAcknowledgement(context, global_state, bind_data);
 }
@@ -502,6 +530,8 @@ TableFunction QuackScanByNameFunction::GetFunction() {
 	fun.get_bind_info = QuackScanGetBindInfo;
 	fun.named_parameters["use_transaction"] = LogicalType::BOOLEAN;
 	fun.named_parameters["refresh_catalog"] = LogicalType::BOOLEAN;
+	fun.named_parameters["connect_session"] = LogicalType::BOOLEAN;
+	fun.named_parameters["parameters"] = LogicalType::ANY;
 	// fun.filter_pushdown = true;
 	// fun.filter_prune = true;
 	return fun;

@@ -7,6 +7,7 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/main/prepared_statement.hpp"
 
 namespace duckdb {
 
@@ -14,7 +15,7 @@ class BinaryDeserializer;
 class ClientContext;
 
 //! Quack wire-protocol version. Client and server agree on it during the connection handshake.
-static constexpr idx_t QUACK_VERSION = 3;
+static constexpr idx_t QUACK_VERSION = 7;
 
 //! Upper bound both peers enforce on the heartbeat lease timeout
 static constexpr idx_t MAX_HEARTBEAT_TIMEOUT_SECONDS = static_cast<idx_t>(NumericLimits<int64_t>::Maximum() / 1000);
@@ -170,6 +171,28 @@ public:
 	optional_idx InlineRows() const {
 		return inline_rows;
 	}
+	void SetParameters(vector<string> names, vector<Value> values) {
+		parameter_names = std::move(names);
+		parameter_values = std::move(values);
+	}
+	const vector<string> &ParameterNames() const {
+		return parameter_names;
+	}
+	const vector<Value> &ParameterValues() const {
+		return parameter_values;
+	}
+	void SetPrepareOnly(bool value) {
+		prepare_only = value;
+	}
+	bool PrepareOnly() const {
+		return prepare_only;
+	}
+	void SetTransactionStateOnly(bool value) {
+		transaction_state_only = value;
+	}
+	bool TransactionStateOnly() const {
+		return transaction_state_only;
+	}
 
 public:
 	const string &Query() const {
@@ -192,6 +215,44 @@ private:
 	string sql_query;
 	hugeint_t query_uuid;
 	optional_idx inline_rows;
+	vector<string> parameter_names;
+	vector<Value> parameter_values;
+	bool prepare_only = false;
+	bool transaction_state_only = false;
+};
+
+//! Native metadata from a bind-only request. LogicalTypes stay binary encoded, including complex types.
+struct QuackPreparedMetadata {
+	StatementType statement_type = StatementType::INVALID_STATEMENT;
+	vector<string> parameter_names;
+	vector<LogicalType> parameter_types;
+	bool requires_valid_transaction = true;
+	QueryResultOutputType output_type = QueryResultOutputType::FORCE_MATERIALIZED;
+	bool bound_all_parameters = true;
+	StatementReturnType return_type = StatementReturnType::QUERY_RESULT;
+	idx_t parameter_count = 0;
+	bool always_require_rebind = false;
+	bool read_only = true;
+
+	explicit QuackPreparedMetadata(const PreparedStatement &statement)
+	    : QuackPreparedMetadata(statement.GetStatementType(), statement.GetStatementProperties()) {
+		for (auto &entry : statement.GetExpectedParameterTypes()) {
+			parameter_names.push_back(entry.first);
+			parameter_types.push_back(entry.second);
+		}
+	}
+	QuackPreparedMetadata(StatementType type, const StatementProperties &properties) : statement_type(type) {
+		requires_valid_transaction = properties.requires_valid_transaction;
+		output_type = properties.output_type;
+		bound_all_parameters = properties.bound_all_parameters;
+		return_type = properties.return_type;
+		parameter_count = properties.parameter_count;
+		always_require_rebind = properties.always_require_rebind;
+		read_only = properties.modified_databases.empty();
+	}
+	QuackPreparedMetadata() = default;
+	void Serialize(Serializer &serializer) const;
+	static unique_ptr<QuackPreparedMetadata> Deserialize(Deserializer &deserializer);
 };
 
 class PrepareResponseMessage : public QuackMessage {
@@ -224,6 +285,21 @@ public:
 	hugeint_t QueryUUID() const {
 		return query_uuid;
 	}
+	void SetPreparedMetadata(unique_ptr<QuackPreparedMetadata> metadata) {
+		prepared_metadata = std::move(metadata);
+	}
+	optional_ptr<QuackPreparedMetadata> PreparedMetadata() {
+		return prepared_metadata.get();
+	}
+	optional_ptr<const QuackPreparedMetadata> PreparedMetadata() const {
+		return prepared_metadata.get();
+	}
+	void SetRemoteAutoCommit(bool value) {
+		remote_auto_commit = value;
+	}
+	bool RemoteAutoCommit() const {
+		return remote_auto_commit;
+	}
 
 	void Serialize(Serializer &serializer) const override;
 	static unique_ptr<PrepareResponseMessage> Deserialize(Deserializer &deserializer);
@@ -238,6 +314,8 @@ private:
 	vector<unique_ptr<DataChunkWrapper>> results;
 	bool needs_more_fetch = false;
 	hugeint_t query_uuid;
+	unique_ptr<QuackPreparedMetadata> prepared_metadata;
+	bool remote_auto_commit = true;
 };
 
 // TODO this is where auth goes
@@ -603,6 +681,9 @@ public:
 	explicit ErrorResponse(ErrorData error_p) : QuackMessage(TYPE), error(std::move(error_p)) {
 	}
 	explicit ErrorResponse(const string &error_p) : QuackMessage(TYPE), error(ExceptionType::INVALID_INPUT, error_p) {
+	}
+	ErrorResponse(ExceptionType error_type, const string &message, const unordered_map<string, string> &extra_info)
+	    : QuackMessage(TYPE), error(StringUtil::ExceptionToJSONMap(error_type, message, extra_info)) {
 	}
 	template <typename... ARGS>
 	explicit ErrorResponse(const string &msg, ARGS &&...params)

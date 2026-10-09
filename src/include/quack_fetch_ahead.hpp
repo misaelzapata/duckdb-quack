@@ -46,7 +46,7 @@ public:
 	                          idx_t &batch_index, vector<unique_ptr<DataChunk>> &chunks);
 
 	//! Stop topping up and drain all in-flight fetches; errors were already surfaced through the buffer.
-	void StopAndDrain();
+	void StopAndDrain(bool cancel_pending = true);
 
 private:
 	//! Register fetch tasks until the batches in flight and in the buffer reach `depth`. Each task
@@ -64,6 +64,7 @@ private:
 
 private:
 	unique_ptr<ManagedAsyncTaskQueue> queue;
+	shared_ptr<QuackClientConnection> client_connection;
 	shared_ptr<QuackFetchBuffer> buffer;
 	hugeint_t query_uuid;
 	string connection_id;

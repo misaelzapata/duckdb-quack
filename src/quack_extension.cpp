@@ -324,8 +324,8 @@ std::string QuackExtension::Name() {
 }
 
 std::string QuackExtension::Version() const {
-#ifdef EXT_VERSION_RPC
-	return EXT_VERSION_RPC;
+#ifdef EXT_VERSION_QUACK
+	return EXT_VERSION_QUACK;
 #else
 	return "";
 #endif
