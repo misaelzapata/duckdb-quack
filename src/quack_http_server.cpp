@@ -14,6 +14,9 @@
 
 namespace duckdb {
 
+//! Cap protected RPC bodies before allocating their serialized/chunk payloads.
+static constexpr idx_t PROTECTED_MAX_REQUEST_BYTES = 64 * 1024 * 1024;
+
 //! httplib hands each accepted socket to the task queue as one task spanning the connection's whole
 //! keep-alive lifetime, so a fixed pool deadlocks once idle connections pin every worker. This pool
 //! grows a thread per connection up to `max_threads` and sheds at the cap (clients retry).
@@ -208,6 +211,9 @@ HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p
 	server->set_keep_alive_max_count(1 << 20);
 	server->set_keep_alive_timeout(NumericCast<time_t>(keep_alive_timeout));
 	server->set_tcp_nodelay(true);
+	if (security_policy) {
+		server->set_payload_max_length(PROTECTED_MAX_REQUEST_BYTES);
+	}
 
 	server->Get("/", [=](const duckdb_httplib::Request &, duckdb_httplib::Response &res) {
 		res.set_content("This is a DuckDB Quack RPC endpoint. Use ATTACH 'quack:...' to connect here.\n", "text/plain");
@@ -222,15 +228,28 @@ HttpQuackServer::HttpQuackServer(ClientContext &context_p, const QuackUri &uri_p
 		res.status = 204;
 	});
 
-	server->Post("/quack", [&](const duckdb_httplib::Request &, duckdb_httplib::Response &res,
+	server->Post("/quack", [&](const duckdb_httplib::Request &req, duckdb_httplib::Response &res,
 	                           const duckdb_httplib::ContentReader &content_reader) {
 		res.set_header("Access-Control-Allow-Origin", "*");
 		MemoryStream stream;
-		content_reader([&](const char *data, size_t data_length) {
-			stream.WriteData((data_ptr_t)data, data_length);
-			return true;
+		bool read_started = false;
+		// remote_addr is the socket peer supplied by httplib; this server configures no trusted proxies.
+		// Forwarded/X-Forwarded-For headers never provide admission or session identity.
+		auto response = HandleMessage(stream, req.remote_addr, [&] {
+			read_started = true;
+			return content_reader([&](const char *data, size_t data_length) {
+				if (security_policy && (data_length > PROTECTED_MAX_REQUEST_BYTES ||
+				                        stream.GetPosition() > PROTECTED_MAX_REQUEST_BYTES - data_length)) {
+					return false;
+				}
+				stream.WriteData((data_ptr_t)data, data_length);
+				return true;
+			});
 		});
-		auto response = HandleMessage(stream);
+		if (!read_started) {
+			// Admission rejected before consuming a body: discard this keep-alive transport too.
+			res.set_header("Connection", "close");
+		}
 		auto raw = response->RawPayload();
 		if (raw) {
 			// Already serialized: httplib sends the bytes with no copy. The shared_ptr keeps them alive.

@@ -31,11 +31,15 @@ public:
 
 	vector<QuackConnectionSnapshot> GetActiveConnectionSnaps();
 	vector<ServerSnapshot> ListServers();
+	void SetSecurityPolicy(shared_ptr<QuackSecurityPolicy> policy);
+	shared_ptr<QuackSecurityPolicy> GetSecurityPolicy();
 
 	static constexpr const char *STORAGE_EXTENSION_KEY = "quack";
 
 private:
 	std::mutex servers_mutex;
 	unordered_map<string, unique_ptr<QuackServer>> servers;
+	std::mutex security_mutex;
+	shared_ptr<QuackSecurityPolicy> security_policy;
 };
 } // namespace duckdb

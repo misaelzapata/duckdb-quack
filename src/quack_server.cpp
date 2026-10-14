@@ -127,8 +127,16 @@ static void SyncResultCache(QuackConnection &connection, QuackResultStream &stre
 //! Runs one client statement with the result collector installed. It holds the statement lock for the
 //! full duration. A statement that returns rows fills the claim buffer in parallel. A statement that
 //! returns a count leaves the count in batch 1, through the fallback below.
+static void AuthorizeBoundStatement(QuackSecurityPolicy &policy, const QuackIdentity &identity,
+                                    const StatementProperties &properties) {
+	if (identity.read_only && !properties.modified_databases.empty()) {
+		throw PermissionException("Quack account is read-only");
+	}
+	policy.AuthorizeBound(identity, properties);
+}
+
 static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream> stream, string sql,
-                       identifier_map_t<BoundParameterData> parameters) {
+                       identifier_map_t<BoundParameterData> parameters, shared_ptr<QuackSecurityPolicy> policy) {
 	// A failed statement must stop the client's sends, so its scan's streams get the error too.
 	auto fail_streams = [&](const ErrorData &error) {
 		if (auto session_state = QuackSessionState::Get(*connection.duckdb_connection->context)) {
@@ -138,11 +146,19 @@ static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream
 	try {
 		unique_lock<mutex> guard(connection.statement_lock);
 		auto &context = *connection.duckdb_connection->context;
+		if (policy) {
+			policy->Authorize(*connection.duckdb_connection, connection.identity, sql);
+		}
 
 		// MakeQuackFetchCollector sends the FIRST statement that returns a result into the stream.
 		// Every other statement keeps the default collector.
 		auto &config = ClientConfig::GetConfig(context);
-		config.get_result_collector = [stream](ClientContext &ctx, PreparedStatementData &data) {
+		config.get_result_collector = [stream, policy, &connection](ClientContext &ctx, PreparedStatementData &data) {
+			// Forced materialization sends EVERY bound statement here before executor initialization,
+			// including non-row-returning controls and EXECUTE after parameter/catalog rebinding.
+			if (policy) {
+				AuthorizeBoundStatement(*policy, connection.identity, data.properties);
+			}
 			return MakeQuackFetchCollector(ctx, data, stream);
 		};
 		unique_ptr<QueryResult> result;
@@ -209,6 +225,10 @@ static void DriveQuery(QuackConnection &connection, shared_ptr<QuackResultStream
 	} catch (std::exception &ex) {
 		stream->buffer.SetError(ErrorData(ex));
 		fail_streams(ErrorData(ex));
+	} catch (...) {
+		auto error = ErrorData(ExceptionType::PERMISSION, "Quack authorization failed");
+		stream->buffer.SetError(error);
+		fail_streams(error);
 	}
 	// Close against the announced total, so a short stream errors instead of truncating.
 	stream->buffer.Finish(stream->announced_total);
@@ -228,6 +248,7 @@ void QuackServer::ValidateToken(const string &token) {
 QuackServer::QuackServer(ClientContext &context_p, const QuackUri &uri_p, const string &token_p)
     : db_ptr(context_p.db), uri(uri_p), token(token_p) {
 	ValidateToken(token);
+	security_policy = QuackStorageExtensionInfo::GetState(*context_p.db).GetSecurityPolicy();
 	server_hmac_key = QuackRandomToken(*context_p.db);
 }
 
@@ -397,7 +418,10 @@ shared_ptr<QuackConnection> QuackServer::GetConnection(const string &connection_
 }
 
 string QuackServer::CreateNewConnection(const string &session_id, const string &client_id_hash,
-                                        idx_t heartbeat_timeout_seconds) {
+                                        idx_t heartbeat_timeout_seconds, QuackIdentity identity, const string &peer) {
+	if (security_policy && (identity.account.empty() || peer.empty())) {
+		throw PermissionException("Quack session requires an authenticated account and peer");
+	}
 	std::lock_guard<std::mutex> lock(active_connections_mutex);
 
 	D_ASSERT(active_connections.find(session_id) == active_connections.end());
@@ -408,6 +432,8 @@ string QuackServer::CreateNewConnection(const string &session_id, const string &
 	}
 	auto new_connection = make_shared_ptr<QuackConnection>(session_id, heartbeat_timeout_seconds);
 	new_connection->client_id_hash = client_id_hash;
+	new_connection->identity = std::move(identity);
+	new_connection->peer = peer;
 	new_connection->live_caches = live_caches;
 	new_connection->duckdb_connection = make_uniq<Connection>(*db);
 	auto &connection_context = *new_connection->duckdb_connection->context;
@@ -525,73 +551,109 @@ bool MessageRequiresConnection(MessageType type) {
 }
 
 // main switcheroo happens here
-unique_ptr<QuackMessage> QuackServer::HandleMessage(MemoryStream &read_stream) {
-	auto db = db_ptr.lock();
-	if (!db) {
-		return make_uniq<ErrorResponse>("Database was closed");
-	}
-	auto &logger = Logger::Get(*db);
-	bool should_log = logger.ShouldLog(QuackLogType::NAME, QuackLogType::LEVEL);
+unique_ptr<QuackMessage> QuackServer::HandleMessage(MemoryStream &read_stream, const string &peer) {
+	return HandleMessage(read_stream, peer, [] { return true; });
+}
 
-	int64_t start_time = 0;
-	if (should_log) {
-		start_time = QuackNowMillis();
-	}
-
-	// start deserializing the message
-	read_stream.Rewind();
-	BinaryDeserializer deserializer(read_stream);
-
-	// first read the header
-	auto header = QuackMessage::DeserializeHeader(deserializer);
-
-	// validate if the server can handle this type of message - the server cannot handle all message types
-	if (!ServerSupportsMessage(header.type)) {
-		return make_uniq<ErrorResponse>("Unsupported message type for server");
-	}
-
-	// if the message requires it, obtain a connection
-	// these are basically all messages aside from connect request
-	shared_ptr<QuackConnection> connection;
-	if (MessageRequiresConnection(header.type)) {
-		connection = GetConnection(header.connection_id);
-		if (!connection) {
-			return make_uniq<ErrorResponse>("Invalid connection id");
+unique_ptr<QuackMessage> QuackServer::HandleMessage(MemoryStream &read_stream, const string &peer,
+                                                   const std::function<bool()> &read_request) {
+	if (security_policy) {
+		try {
+			if (peer.empty() || !security_policy->AdmitRequest(peer)) {
+				return make_uniq<ErrorResponse>("Quack request rejected");
+			}
+		} catch (...) {
+			return make_uniq<ErrorResponse>("Quack request rejected");
 		}
 	}
-
-	SweepExpiredCaches(*db);
-
-	// now deserialize the actual message, and any raw chunk blob that follows it
-	auto received_message = QuackMessage::DeserializeMessage(deserializer, header);
-	if (connection) {
-		// Only supported, structurally valid messages for an existing session renew its lease.
-		if (!RenewConnectionLease(header.connection_id, connection)) {
-			return make_uniq<ErrorResponse>("Connection heartbeat lease expired");
+	try {
+		if (!read_request()) {
+			return make_uniq<ErrorResponse>("Invalid Quack request body");
 		}
-	}
-
-	// process the message
-	auto response = HandleMessageInternal(*db, *received_message, connection);
-
-	if (should_log) {
-		auto duration_ms = QuackNowMillis() - start_time;
-		string error;
-		if (response->Type() == MessageType::ERROR_RESPONSE) {
-			error = response->Cast<ErrorResponse>().ErrorMessage();
+		auto db = db_ptr.lock();
+		if (!db) {
+			return make_uniq<ErrorResponse>("Database was closed");
 		}
-		auto client_id_hash = connection ? connection->client_id_hash : string();
-		auto msg = QuackLogType::ConstructLogMessage(header.type, header.connection_id, client_id_hash,
-		                                             header.client_query_id, ExtractQuery(*received_message), "",
-		                                             duration_ms, response->Type(), error);
-		logger.WriteLog(QuackLogType::NAME, QuackLogType::LEVEL, msg);
-	}
+		auto &logger = Logger::Get(*db);
+		bool should_log = logger.ShouldLog(QuackLogType::NAME, QuackLogType::LEVEL);
 
-	return response;
+		int64_t start_time = 0;
+		if (should_log) {
+			start_time = QuackNowMillis();
+		}
+
+		// start deserializing the message
+		read_stream.Rewind();
+		BinaryDeserializer deserializer(read_stream);
+
+		// first read the header
+		auto header = QuackMessage::DeserializeHeader(deserializer);
+
+		// validate if the server can handle this type of message - the server cannot handle all message types
+		if (!ServerSupportsMessage(header.type)) {
+			return make_uniq<ErrorResponse>("Unsupported message type for server");
+		}
+		if (security_policy && header.type == MessageType::CONNECTION_REQUEST) {
+			try {
+				if (!security_policy->AdmitConnection(peer)) {
+					return make_uniq<ErrorResponse>("Quack connection rejected");
+				}
+			} catch (...) {
+				return make_uniq<ErrorResponse>("Quack connection rejected");
+			}
+		}
+
+		// if the message requires it, obtain a connection
+		// these are basically all messages aside from connect request
+		shared_ptr<QuackConnection> connection;
+		if (MessageRequiresConnection(header.type)) {
+			connection = GetConnection(header.connection_id);
+			if (!connection) {
+				return make_uniq<ErrorResponse>("Invalid connection id");
+			}
+			if (security_policy && connection->peer != peer) {
+				return make_uniq<ErrorResponse>("Quack session peer mismatch");
+			}
+		}
+
+		SweepExpiredCaches(*db);
+
+		// now deserialize the actual message, and any raw chunk blob that follows it
+		auto received_message = QuackMessage::DeserializeMessage(deserializer, header);
+		if (connection) {
+			// Only supported, structurally valid messages for an existing session renew its lease.
+			if (!RenewConnectionLease(header.connection_id, connection)) {
+				return make_uniq<ErrorResponse>("Connection heartbeat lease expired");
+			}
+		}
+
+		// process the message
+		auto response = HandleMessageInternal(*db, *received_message, connection, peer);
+
+		if (should_log) {
+			auto duration_ms = QuackNowMillis() - start_time;
+			string error;
+			if (response->Type() == MessageType::ERROR_RESPONSE) {
+				error = response->Cast<ErrorResponse>().ErrorMessage();
+			}
+			auto client_id_hash = connection ? connection->client_id_hash : string();
+			auto msg = QuackLogType::ConstructLogMessage(header.type, header.connection_id, client_id_hash,
+			                                             header.client_query_id, ExtractQuery(*received_message), "",
+			                                             duration_ms, response->Type(), error);
+			logger.WriteLog(QuackLogType::NAME, QuackLogType::LEVEL, msg);
+		}
+
+		return response;
+	} catch (std::exception &ex) {
+		return make_uniq<ErrorResponse>(ErrorData(ex));
+	} catch (...) {
+		return make_uniq<ErrorResponse>("Quack request failed");
+	}
 }
 
 unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db, QuackMessage &received_message,
-                                                            optional_ptr<QuackConnection> connection_p) {
+                                                            optional_ptr<QuackConnection> connection_p,
+                                                            const string &peer) {
 	switch (received_message.Type()) {
 	case MessageType::CONNECTION_REQUEST: {
 		auto &connection_request_message = received_message.Cast<ConnectionRequestMessage>();
@@ -607,18 +669,33 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 			    "heartbeat_timeout out of range - must be between 1 and %llu seconds", MAX_HEARTBEAT_TIMEOUT_SECONDS));
 		}
 		string session_id = GenerateSessionId();
-		auto auth = EvaluateAuthQuery(
-		    db, StringUtil::Format("SELECT %s(?, ?, ?)", GetSettingString(db, "quack_authentication_function")),
-		    Value(session_id), Value(connection_request_message.AuthString()), Value(Token()));
-		if (auth.Denied()) {
-			return auth.Failure("Authentication");
+		QuackIdentity identity;
+		if (security_policy) {
+			try {
+				// A configured policy is authoritative: the owner's shared token never reaches legacy auth.
+				if (!security_policy->Authenticate(peer, connection_request_message.AuthString(), identity) ||
+				    identity.account.empty()) {
+					return make_uniq<ErrorResponse>("Authentication failed");
+				}
+			} catch (...) {
+				// Callback errors may contain credentials. Do not put them in protocol errors or logs.
+				return make_uniq<ErrorResponse>("Authentication failed");
+			}
+		} else {
+			auto auth = EvaluateAuthQuery(
+			    db, StringUtil::Format("SELECT %s(?, ?, ?)", GetSettingString(db, "quack_authentication_function")),
+			    Value(session_id), Value(connection_request_message.AuthString()), Value(Token()));
+			if (auth.Denied()) {
+				return auth.Failure("Authentication");
+			}
 		}
 		string client_id_hash;
 		if (!connection_request_message.ClientId().empty()) {
 			client_id_hash = ComputeClientHash(server_hmac_key, connection_request_message.ClientId());
 		}
 		return make_uniq<ConnectionResponseMessage>(
-		    CreateNewConnection(session_id, client_id_hash, heartbeat_timeout_seconds), heartbeat_timeout_seconds);
+		    CreateNewConnection(session_id, client_id_hash, heartbeat_timeout_seconds, std::move(identity), peer),
+		    heartbeat_timeout_seconds);
 	}
 	case MessageType::DISCONNECT_MESSAGE: {
 		auto &connection = *connection_p;
@@ -631,16 +708,24 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		auto &prepare_request_message = received_message.Cast<PrepareRequestMessage>();
 		auto &connection = *connection_p;
 
-		// TODO do not do this if there is no fun set
-		auto authz = EvaluateAuthQuery(
-		    db, StringUtil::Format("SELECT %s(?, ?)", GetSettingString(db, "quack_authorization_function")),
-		    Value(prepare_request_message.ConnectionId()), Value(prepare_request_message.Query()));
-		if (authz.Denied()) {
-			return authz.Failure("Authorization");
+		auto effective_sql = prepare_request_message.Query();
+		if (!security_policy) {
+			auto authz = EvaluateAuthQuery(
+			    db, StringUtil::Format("SELECT %s(?, ?)", GetSettingString(db, "quack_authorization_function")),
+			    Value(prepare_request_message.ConnectionId()), Value(prepare_request_message.Query()));
+			if (authz.Denied()) {
+				return authz.Failure("Authorization");
+			}
+			if (authz.value.type().id() == LogicalTypeId::VARCHAR) {
+				effective_sql = authz.value.GetValue<string>();
+			}
 		}
-		auto effective_sql = (authz.value.type().id() == LogicalTypeId::VARCHAR) ? authz.value.GetValue<string>()
-		                                                                         : prepare_request_message.Query();
 		if (prepare_request_message.TransactionStateOnly()) {
+			if (security_policy) {
+				// An empty-SQL control probe executes no statement and must not wait behind a
+				// producer parked on client FETCH/SEND_DATA. Policies should handle it as a probe.
+				security_policy->Authorize(*connection.duckdb_connection, connection.identity, "");
+			}
 			// A read-only control probe must not abort or replace the session's current result stream.
 			auto response = make_uniq<PrepareResponseMessage>(vector<LogicalType>(), vector<string>(),
 			    vector<unique_ptr<DataChunkWrapper>>(), false, hugeint_t {0, 0});
@@ -652,9 +737,15 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 		AbortStatement(connection, "superseded by a new query");
 		if (prepare_request_message.PrepareOnly()) {
 			unique_lock<mutex> guard(connection.statement_lock);
+			if (security_policy) {
+				security_policy->Authorize(*connection.duckdb_connection, connection.identity, effective_sql);
+			}
 			auto prepared = connection.duckdb_connection->Prepare(effective_sql);
 			if (prepared->HasError()) {
 				return make_uniq<ErrorResponse>(prepared->GetErrorObject());
+			}
+			if (security_policy) {
+				AuthorizeBoundStatement(*security_policy, connection.identity, prepared->GetStatementProperties());
 			}
 			vector<string> result_names;
 			for (auto &name : prepared->GetNames()) {
@@ -722,7 +813,7 @@ unique_ptr<QuackMessage> QuackServer::HandleMessageInternal(DatabaseInstance &db
 				session_state->SetStatement(stream);
 			}
 			connection.statement.thread =
-			    std::thread(DriveQuery, std::ref(connection), stream, effective_sql, std::move(parameters));
+			    std::thread(DriveQuery, std::ref(connection), stream, effective_sql, std::move(parameters), security_policy);
 		}
 		AbortDetachedStatement(connection, std::move(superseded), "superseded by a new query");
 
