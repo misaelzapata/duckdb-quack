@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <queue>
 #include <thread>
 
@@ -12,6 +13,7 @@
 #include "duckdb/common/unordered_map.hpp"
 
 #include "quack_result_cache.hpp"
+#include "quack_security.hpp"
 #include "quack_uri.hpp"
 
 #include "httplib.hpp" // TODO forward declare
@@ -66,6 +68,9 @@ struct QuackConnection {
 	//! Current query UUID
 	hugeint_t query_uuid;
 	string session_id;
+	//! Set before publication; neither credentials nor the owner's server token are retained here.
+	QuackIdentity identity;
+	string peer;
 
 	void SyncCachedRows() {
 		cached_rows = result_cache ? result_cache->retained_rows : DConstants::INVALID_INDEX;
@@ -140,7 +145,8 @@ public:
 	virtual void Close() {};
 
 	shared_ptr<QuackConnection> GetConnection(const string &connection_id);
-	string CreateNewConnection(const string &session_id, const string &client_id_hash, idx_t heartbeat_timeout_seconds);
+	string CreateNewConnection(const string &session_id, const string &client_id_hash, idx_t heartbeat_timeout_seconds,
+	                           QuackIdentity identity, const string &peer);
 	bool DisconnectConnection(const string &session_id);
 	// TODO need something to destroy connections
 
@@ -165,13 +171,17 @@ public:
 	}
 
 protected:
-	unique_ptr<QuackMessage> HandleMessage(MemoryStream &read_stream);
+	//! The empty-peer default is for trusted, unprotected internal transports only.
+	unique_ptr<QuackMessage> HandleMessage(MemoryStream &read_stream, const string &peer = "");
+	//! HTTP supplies a deferred reader so admission runs before request-body allocation.
+	unique_ptr<QuackMessage> HandleMessage(MemoryStream &read_stream, const string &peer,
+	                                      const std::function<bool()> &read_request);
 	//! Drops caches idle past quack_result_ttl
 	void SweepExpiredCaches(DatabaseInstance &db);
 	//! Give `connection` its expiry-queue slot when its cache is created; caller must hold connection.lock.
 	void RegisterCacheForExpiry(QuackConnection &connection);
 	unique_ptr<QuackMessage> HandleMessageInternal(DatabaseInstance &db, QuackMessage &received_message,
-	                                               optional_ptr<QuackConnection> connection);
+	                                               optional_ptr<QuackConnection> connection, const string &peer);
 
 protected:
 	std::vector<std::thread> listen_threads;
@@ -185,6 +195,8 @@ protected:
 	std::priority_queue<CacheExpiryEntry, vector<CacheExpiryEntry>, CacheExpiresLater> cache_expiry_queue;
 
 	QuackUri uri;
+	//! A running protected server cannot be downgraded by replacing database-level policy state.
+	shared_ptr<QuackSecurityPolicy> security_policy;
 
 private:
 	bool RenewConnectionLease(const string &connection_id, const shared_ptr<QuackConnection> &connection);

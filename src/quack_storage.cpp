@@ -22,6 +22,20 @@ QuackStorageExtensionInfo &QuackStorageExtensionInfo::GetState(const DatabaseIns
 	return *static_cast<QuackStorageExtensionInfo *>(ext->storage_info.get());
 }
 
+void QuackStorageExtensionInfo::SetSecurityPolicy(shared_ptr<QuackSecurityPolicy> policy) {
+	std::lock_guard<std::mutex> lock(security_mutex);
+	security_policy = std::move(policy);
+}
+
+shared_ptr<QuackSecurityPolicy> QuackStorageExtensionInfo::GetSecurityPolicy() {
+	std::lock_guard<std::mutex> lock(security_mutex);
+	return security_policy;
+}
+
+void duckdb::SetQuackSecurityPolicy(DatabaseInstance &db, shared_ptr<QuackSecurityPolicy> policy) {
+	QuackStorageExtensionInfo::GetState(db).SetSecurityPolicy(std::move(policy));
+}
+
 QuackServer &QuackStorageExtensionInfo::CreateServer(ClientContext &context, const QuackUri &listen_uri,
                                                      const string &token) {
 	auto server = make_uniq<HttpQuackServer>(context, listen_uri, token);
